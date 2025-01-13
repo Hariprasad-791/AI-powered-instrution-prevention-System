@@ -167,13 +167,13 @@ ae_features = np.array(['FlowDuration',
 flow_count = 0
 flow_df = pd.DataFrame(columns =cols)
 
-
 src_ip_dict = {}
 
 current_flows = {}
 FlowTimeout = 600
 
-
+# Initialize the blocked IPs set
+blocked_ips = set()
 ae_scaler = joblib.load("models/preprocess_pipeline_AE_39ft.save")
 ae_model = keras.models.load_model('models/autoencoder_39ft.hdf5')
 
@@ -185,6 +185,7 @@ with open('models/explainer', 'rb') as f:
 predict_fn_rf = lambda x: classifier.predict_proba(x).astype(float)
 
 def classify(features):
+    # preprocess
     global flow_count
     feature_string = [str(i) for i in features[39:]]
     record = features.copy()
@@ -197,7 +198,7 @@ def classify(features):
         src_ip_dict[feature_string[0]] = 1
 
     for i in [0,2]:
-        ip = feature_string[i] 
+        ip = feature_string[i] #feature_string[0] is src, [2] is dst
         if not ipaddress.ip_address(ip).is_private:
             country = ipInfo(ip)
             if country is not None and country not in  ['ano', 'unknown']:
@@ -211,6 +212,7 @@ def classify(features):
     if np.nan in features:
         return
 
+    # features = normalisation.transform([features])
     result = classifier.predict([features])
     proba = predict_fn_rf([features])
     proba_score = [proba[0].max()]
@@ -221,6 +223,9 @@ def classify(features):
     if proba_risk >0.2: risk = ["<p style=\"color:green;\">Low</p>"]
     else: risk = ["<p style=\"color:limegreen;\">Minimal</p>"]
 
+    # x = K.process(features[0])
+    # z_scores = round((x-m)/s,2)
+    # p_values = norm.sf(abs(z_scores))*2
 
 
     classification = [str(result[0])]
@@ -244,10 +249,6 @@ def classify(features):
     ip_data= pd.DataFrame(ip_data)
     ip_data=ip_data.to_json(orient='records')
 
-    # socketio.emit('newresult', {'result': feature_string +[z_scores]+ classification, "ips": json.loads(ip_data)}, namespace='/test')
-    # print(json.loads(ip_data))
-    # # socketio.emit('newresult', {'result': feature_string + classification}, namespace='/test')
-    # return feature_string +[z_scores]+ classification
 
     socketio.emit('newresult', {'result':[flow_count]+ feature_string + classification + proba_score + risk, "ips": json.loads(ip_data)}, namespace='/test')
     # socketio.emit('newresult', {'result': feature_string + classification}, namespace='/test')
@@ -256,8 +257,16 @@ def classify(features):
 def newPacket(p):
     try:
         packet = PacketInfo()
-        packet.setDest(p)
         packet.setSrc(p)
+        src_ip = packet.getSrc()
+
+        # Drop packets from blocked IPs
+        if src_ip in blocked_ips:
+            print(f"Packet from {src_ip} dropped (blocked).")
+            return  # Skip further processing of this packet
+
+        # Continue processing the packet
+        packet.setDest(p)
         packet.setSrcPort(p)
         packet.setDestPort(p)
         packet.setProtocol(p)
@@ -275,70 +284,71 @@ def newPacket(p):
         packet.setFwdID()
         packet.setBwdID()
 
-     
+        # Handle flow logic (existing implementation)
         if packet.getFwdID() in current_flows.keys():
             flow = current_flows[packet.getFwdID()]
-
-          
+            # Handle timeout or FIN/RST flags
             if (packet.getTimestamp() - flow.getFlowLastSeen()) > FlowTimeout:
                 classify(flow.terminated())
                 del current_flows[packet.getFwdID()]
                 flow = Flow(packet)
                 current_flows[packet.getFwdID()] = flow
-
-            # check for fin flag
             elif packet.getFINFlag() or packet.getRSTFlag():
                 flow.new(packet, 'fwd')
                 classify(flow.terminated())
                 del current_flows[packet.getFwdID()]
-                del flow
-
             else:
                 flow.new(packet, 'fwd')
                 current_flows[packet.getFwdID()] = flow
-
         elif packet.getBwdID() in current_flows.keys():
             flow = current_flows[packet.getBwdID()]
-
-            # check for timeout
             if (packet.getTimestamp() - flow.getFlowLastSeen()) > FlowTimeout:
                 classify(flow.terminated())
                 del current_flows[packet.getBwdID()]
-                del flow
                 flow = Flow(packet)
                 current_flows[packet.getFwdID()] = flow
-
             elif packet.getFINFlag() or packet.getRSTFlag():
                 flow.new(packet, 'bwd')
                 classify(flow.terminated())
                 del current_flows[packet.getBwdID()]
-                del flow
             else:
                 flow.new(packet, 'bwd')
                 current_flows[packet.getBwdID()] = flow
         else:
-
             flow = Flow(packet)
             current_flows[packet.getFwdID()] = flow
-            # current flows put id, (new) flow
 
     except AttributeError:
-        # not IP or TCP
+        # Handle invalid packets
         return
-
-    except:
+    except Exception:
         traceback.print_exc()
 
 
 def snif_and_detect():
-
     while not thread_stop_event.isSet():
         print("Begin Sniffing".center(20, ' '))
-        # sniff(iface="en0", prn=newPacket)
-        sniff(prn=newPacket)
+        sniff(prn=newPacket, store=False)  # Use store=False for performance
         for f in current_flows.values():
-            
             classify(f.terminated())
+
+
+@app.route('/toggle-block', methods=['POST'])
+def toggle_block():
+    data = request.get_json()
+    src_ip = data.get('src_ip')
+    if not src_ip:
+        return {'message': 'Invalid IP'}, 400
+
+    if src_ip in blocked_ips:
+        blocked_ips.remove(src_ip)
+        action = "unblocked"
+    else:
+        blocked_ips.add(src_ip)
+        action = "blocked"
+
+    return {'message': f'{src_ip} has been {action}.', 'status': action}, 200
+
 
 
 @app.route('/')
@@ -346,51 +356,83 @@ def index():
     #only by sending this page first will the client be connected to the socketio instance
     return render_template('index.html')
 
-@app.route('/flow-detail')
-def flow_detail():
-    flow_id = request.args.get('flow_id', default = -1, type = int) #/flow-detail?flow_id=x
-    # print(flow_id)
-    flow = flow_df.loc[flow_df['FlowID'] == flow_id]
-    # X = normalisation.transform([flow.values[0,1:40]])
-    X = [flow.values[0,1:40]]
-    choosen_instance = X
-    proba_score = list(predict_fn_rf(choosen_instance))
-    risk_proba =  sum(proba_score[0][1:])
-    if risk_proba >0.8: risk = "Risk: <p style=\"color:red;\">Very High</p>"
-    elif risk_proba >0.6: risk = "Risk: <p style=\"color:orangered;\">High</p>"
-    if risk_proba >0.4: risk = "Risk: <p style=\"color:orange;\">Medium</p>"
-    if risk_proba >0.2: risk = "Risk: <p style=\"color:green;\">Low</p>"
-    else: risk = "Risk: <p style=\"color:limegreen;\">Minimal</p>"
-    exp = explainer.explain_instance(choosen_instance[0], predict_fn_rf, num_features=6, top_labels = 1)
+def newPacket(p):
+    try:
+        packet = PacketInfo()
+        packet.setSrc(p)
+        src_ip = packet.getSrc()
 
-    X_transformed = ae_scaler.transform(X)
-    reconstruct = ae_model.predict(X_transformed)
-    err = reconstruct - X_transformed
-    abs_err = np.absolute(err)
-    
-    ind_n_abs_largest = np.argpartition(abs_err, -5)[-5:]
+        # Drop packets from blocked IPs
+        if src_ip in blocked_ips:
+            print(f"Packet from {src_ip} dropped (blocked).")
+            return  # Skip further processing of this packet
 
-    col_n_largest = ae_features[ind_n_abs_largest]
-    # og_n_largest = X[ind_n_abs_largest]
-    err_n_largest = err[0][ind_n_abs_largest]
-    plot_div = plotly.offline.plot({
-    "data": [
-        plotly.graph_objs.Bar(x=col_n_largest[0].tolist(),y=err_n_largest[0].tolist())
-    ]
-    }, include_plotlyjs=False, output_type='div')
+        # Continue processing the packet
+        packet.setDest(p)
+        packet.setSrcPort(p)
+        packet.setDestPort(p)
+        packet.setProtocol(p)
+        packet.setTimestamp(p)
+        packet.setPSHFlag(p)
+        packet.setFINFlag(p)
+        packet.setSYNFlag(p)
+        packet.setACKFlag(p)
+        packet.setURGFlag(p)
+        packet.setRSTFlag(p)
+        packet.setPayloadBytes(p)
+        packet.setHeaderBytes(p)
+        packet.setPacketSize(p)
+        packet.setWinBytes(p)
+        packet.setFwdID()
+        packet.setBwdID()
 
-    # return render_template('detail.html',  tables=[flow.to_html(classes='data')], titles=flow.columns.values, explain = exp.as_html())
+        # Handle flow logic (existing implementation)
+        if packet.getFwdID() in current_flows.keys():
+            flow = current_flows[packet.getFwdID()]
+            # Handle timeout or FIN/RST flags
+            if (packet.getTimestamp() - flow.getFlowLastSeen()) > FlowTimeout:
+                classify(flow.terminated())
+                del current_flows[packet.getFwdID()]
+                flow = Flow(packet)
+                current_flows[packet.getFwdID()] = flow
+            elif packet.getFINFlag() or packet.getRSTFlag():
+                flow.new(packet, 'fwd')
+                classify(flow.terminated())
+                del current_flows[packet.getFwdID()]
+            else:
+                flow.new(packet, 'fwd')
+                current_flows[packet.getFwdID()] = flow
+        elif packet.getBwdID() in current_flows.keys():
+            flow = current_flows[packet.getBwdID()]
+            if (packet.getTimestamp() - flow.getFlowLastSeen()) > FlowTimeout:
+                classify(flow.terminated())
+                del current_flows[packet.getBwdID()]
+                flow = Flow(packet)
+                current_flows[packet.getFwdID()] = flow
+            elif packet.getFINFlag() or packet.getRSTFlag():
+                flow.new(packet, 'bwd')
+                classify(flow.terminated())
+                del current_flows[packet.getBwdID()]
+            else:
+                flow.new(packet, 'bwd')
+                current_flows[packet.getBwdID()] = flow
+        else:
+            flow = Flow(packet)
+            current_flows[packet.getFwdID()] = flow
 
-    return render_template('detail.html', tables=[flow.reset_index(drop=True).transpose().to_html(classes='data')], exp=exp.as_html(), ae_plot = plot_div, risk = risk) # titles=flow.columns.values, classifier='RF Classifier'
-
-
-
+    except AttributeError:
+        # Handle invalid packets
+        return
+    except Exception:
+        traceback.print_exc()
 
 @socketio.on('connect', namespace='/test')
 def test_connect():
+    # need visibility of the global thread object
     global thread
     print('Client connected')
 
+    #Start the random result generator thread only if the thread has not been started before.
     if not thread.is_alive():
         print("Starting Thread")
         thread = socketio.start_background_task(snif_and_detect)
